@@ -18,8 +18,8 @@ LST_VINTAGES = [datetime(2020, 3, 31), datetime(2020, 6, 30), datetime(2020, 9, 
                 datetime(2021, 3, 31)]
 START_DATE = datetime(2020, 1, 1)
 END_DATE = datetime(2021, 3, 31)
-NUM_EPP = 100
-MPP_SEED_FUND = 100
+NUM_EPP = 110
+MPP_SEED_FUND = 10000
 DCT_STATE = dict()
 PROJ_FOLDER = os.path.join(os.getenv('QRSHARE'),  "ProductDesign", "TFI", "OneOff", "data")
 
@@ -28,8 +28,8 @@ def main(argv):
     t0 = perf_counter()
     input_args = mu.arg_handler(argv, input_args=dict(
         nu=0.005, ec_power=2., mc_power=1.5, ec_premium_mult=1.1, mc_premium_mult=1.1, ec_half_life=14, mc_half_life=7,
-        mpp_premium_share=0., min_coverage=.2, adv_fee_pct=0.0001, excess_loss_credit=0.5,
-        recapitalization_threshold=.25, event_penalty=.1),
+        adv_fee_pct=0.0001, excess_loss_credit=0.5, event_mpp_fee=.1,
+        recapitalization_threshold=.9),
                                 name='OneOff/adventis_sim.py')
     mu.setup_logger(log_folder=os.path.join(os.getenv('QRSHARE'),  "ProductDesign", "TFI", "OneOff", "logs"),
                     filename=os.path.basename(__file__)[:-3], console_level=logging.INFO)
@@ -43,7 +43,7 @@ def main(argv):
     init_mpp_capital = 1e7
     DCT_STATE['epp'] = pd.concat(
         flatten([[pd.DataFrame(
-            {'bias': random.normalvariate(0, .5), 'noise': .02 * random.betavariate(2, 2), 'vintage': v,
+            {'bias': random.normalvariate(0, .5), 'noise': .05 * random.betavariate(2, 2), 'vintage': v,
              'available': init_epp_capital, 'staked': 0, 'active': True},
             index=[f'0xv{LST_VINTAGES.index(v)}e{i}']) for i in np.arange(NUM_EPP)] for v in LST_VINTAGES]))
     DCT_STATE['adv_price'] = pd.Series(
@@ -67,7 +67,7 @@ def main(argv):
     DCT_STATE['rand'] = DCT_STATE['pregen_rand'].copy()
     DCT_STATE['mpp'] = {'tokens': MPP_SEED_FUND, 'available': init_mpp_capital, 'staked': MPP_SEED_FUND}
     DCT_STATE['mpp_vintage_size'] = {v: 0 for v in LST_VINTAGES}
-    DCT_STATE['mezz_coll'] = pd.Series()
+    DCT_STATE['mezz_coll'] = pd.Series(dtype=float)
     DCT_STATE['recap_tokens'] = 0
     DCT_STATE['n_adv_tokens'] = 1e7
     DCT_STATE['cashflow'] = pd.DataFrame(
@@ -97,11 +97,12 @@ def main(argv):
             for et in LST_TYPES:
                 mint_aes(dt=dt, vintage=v, event_type=et)
         execute_events(dt)
-        if dt.weekday() == 5:
+        if dt.day == 1:
             DCT_STATE['mezz_coll'] *= np.nan
 
         # Wrap up pools on the expiration date of the contracts
         if dt in LST_VINTAGES:
+            logging.info(f"End of vintage {dt:%Y-%m-%d}.")
             df_epp = DCT_STATE['epp'][DCT_STATE['epp']['vintage'] == dt].copy()
             for epp0x in df_epp.index:
                 cfi = DCT_STATE['cashflow'].shape[0]
@@ -194,34 +195,25 @@ def mint_aes(dt, vintage=None, event_type=None, notional=None, epp0x=None):
 
     # Calculate collateral requirements
     df_aes = DCT_STATE['aes'].copy()
-    if not df_aes.empty:
-        df_aes = df_aes[df_aes['vintage'] > dt].copy()
-    for v in ['notional', 'equity_pool', 'active', 'excess_loss', 'date_created', 'premium_pct', 'id']:
+    for v in ['notional', 'equity_pool', 'active', 'excess_loss', 'date_created', 'premium_pct', 'id', 'vintage']:
         df_aes.loc[id16, v] = dct_aes[v]
     eq_coll = req_eq_coll(epp0x, df_aes, dt)
     mezz_coll = req_mezz_coll(df_aes, dt, new_eq_coll=pd.Series(index=[epp0x], data=[eq_coll]))
     addl_mezz_coll = mezz_coll - DCT_STATE['mpp']['staked']
 
-    # Premium distribution amounts
-    if eq_coll - df_epp.loc[epp0x, 'staked'] < notional * DCT_STATE['min_coverage']:
-        mpp_premium_amt = DCT_STATE['mpp_premium_share'] * premium_pct * notional
-        epp_premium_amt = (1 - DCT_STATE['mpp_premium_share']) * premium_pct * notional
-    else:
-        mpp_premium_amt = 0.
-        epp_premium_amt = premium_pct * notional
-    DCT_STATE['epp'].loc[epp0x, 'staked'] += epp_premium_amt
-
     # Additional equity collateral required net of premium
-    addl_eq_col = eq_coll - df_epp.loc[epp0x, 'staked'] - epp_premium_amt
+    premium_amt = premium_pct * notional
+    addl_eq_coll = eq_coll - df_epp.loc[epp0x, 'staked'] - premium_amt
 
     # Check EPP has sufficient available funds
-    if df_epp.loc[epp0x, 'available'] < addl_eq_col:
+    if df_epp.loc[epp0x, 'available'] < addl_eq_coll:
         logging.warning(f"EPP {epp0x} has insufficient free capital to execute a new AES")
         return mint_aes(dt, vintage, event_type, notional)
 
     # If additional collateral is greater than collateral for a new wallet, abandon this one
-    if addl_eq_col - epp_premium_amt > notional:
-        logging.info(f"EPP {epp0x} has abandoned this wallet")
+    if addl_eq_coll - premium_amt > notional:
+        if (dt - DCT_STATE['aes'].loc[DCT_STATE['aes']['equity_pool'] == epp0x, 'date_created'].max()).days < 30:
+            return mint_aes(dt, vintage, event_type, notional)
         # Add new EPP wallet with same parameters
         new_epp = DCT_STATE['epp'].loc[[epp0x]].copy()
         new_epp['staked'] = 0.
@@ -231,9 +223,9 @@ def mint_aes(dt, vintage=None, event_type=None, notional=None, epp0x=None):
         DCT_STATE['epp'].loc[epp0x, 'active'] = False
         return mint_aes(dt, vintage, event_type, notional, epp0x=new_epp.index[0])
 
-    if addl_eq_col > 0:
-        DCT_STATE['epp'].loc[epp0x, 'available'] -= addl_eq_col
-        DCT_STATE['epp'].loc[epp0x, 'staked'] += addl_eq_col
+    if addl_eq_coll > 0:
+        DCT_STATE['epp'].loc[epp0x, 'staked'] += premium_amt + addl_eq_coll
+        DCT_STATE['epp'].loc[epp0x, 'available'] -= addl_eq_coll
 
     # ADV tokens burned to pay protocol usage fee
     adv_fee_tokens = DCT_STATE['adv_fee_tokens'].loc[dt] * notional
@@ -243,13 +235,13 @@ def mint_aes(dt, vintage=None, event_type=None, notional=None, epp0x=None):
 
     df_cf = DCT_STATE['cashflow']
     cfie = df_cf.shape[0]
-    df_cf.loc[cfie, 'amount'] = epp_premium_amt - addl_eq_col - adv_fee
+    df_cf.loc[cfie, 'amount'] = premium_amt - addl_eq_coll - adv_fee
     df_cf.loc[cfie, 'date'] = dt
     df_cf.loc[cfie, '0x'] = epp0x
     df_cf.loc[cfie, 'id'] = id16
-    if mpp_premium_amt > 0:
-        cfim = df_cf.shape[0]
-        df_cf.loc[cfim, 'amount'] = mpp_premium_amt - np.maximum(0, addl_mezz_coll)
+    cfim = df_cf.shape[0]
+    if addl_mezz_coll > 0:
+        df_cf.loc[cfim, 'amount'] = - np.maximum(0, addl_mezz_coll)
         df_cf.loc[cfim, 'date'] = dt
         df_cf.loc[cfim, '0x'] = 'mpp'
         df_cf.loc[cfim, 'id'] = id16
@@ -261,9 +253,6 @@ def mint_aes(dt, vintage=None, event_type=None, notional=None, epp0x=None):
         DCT_STATE['mpp']['staked'] += addl_mezz_coll
         DCT_STATE['mpp']['available'] -= addl_mezz_coll
         DCT_STATE['mpp_vintage_size'][vintage] += addl_mezz_coll
-
-    # Premium distribution to MPP includes new tokenholders
-    DCT_STATE['mpp'][f'staked'] += mpp_premium_amt
 
     # Add new AES to global DF of AES
     DCT_STATE['aes'] = pd.concat([DCT_STATE['aes'], pd.DataFrame(dct_aes, index=[id16])])
@@ -317,7 +306,7 @@ def req_coll(epp0x, df_aes, dt, decay, power, premium_mult, excess_loss_credit):
 
 
 def req_eq_coll(epp0x, df_aes, dt):
-    return req_coll(epp0x, df_aes, dt,
+    return req_coll(epp0x, df_aes[df_aes['vintage'] > dt], dt,
                     decay=DCT_STATE['ec_decay'],
                     power=DCT_STATE['ec_power'],
                     premium_mult=DCT_STATE['ec_premium_mult'],
@@ -328,7 +317,7 @@ def req_mezz_coll(df_aes, dt, new_eq_coll=None):
     if df_aes.empty:
         return 0
 
-    active_epp = df_aes.loc[df_aes['active'], 'equity_pool'].unique()
+    active_epp = df_aes.loc[df_aes['active'] & (df_aes['vintage'] > dt), 'equity_pool'].unique()
     df_coll = pd.DataFrame(index=active_epp, columns=['mezz', 'eq', 'new_eq'])
     df_coll['mezz'] = DCT_STATE['mezz_coll']
     if new_eq_coll is None:
@@ -338,6 +327,9 @@ def req_mezz_coll(df_aes, dt, new_eq_coll=None):
 
     for epp0x in active_epp:
         if pd.notna(df_coll.loc[epp0x, 'mezz']):
+            continue
+        if df_coll.loc[epp0x, 'eq'] > .9 * df_aes.loc[df_aes['equity_pool'] == epp0x, 'notional'].sum():
+            df_coll.loc[epp0x, 'mezz'] = 0
             continue
         df_coll.loc[epp0x, 'mezz'] = np.maximum(0, req_coll(
             epp0x, df_aes, dt,
@@ -350,34 +342,6 @@ def req_mezz_coll(df_aes, dt, new_eq_coll=None):
     DCT_STATE['mezz_coll'] = s_mc.reset_index().drop_duplicates(subset=['index'], keep='last').set_index('index')[0]
 
     return df_coll['mezz'].sum()
-
-    # if not DCT_STATE['aes'].empty:
-    #     DCT_STATE['aes'].loc[~DCT_STATE['aes']['active'], 'mezz_coll'] = 0
-    #     df_aes['mezz_coll'] = DCT_STATE['aes']['mezz_coll']
-    #
-    # for epp0x in df_aes.loc[df_aes['mezz_coll'].isna() & df_aes['active'], 'equity_pool'].unique():
-    #     epp_ix = (df_aes['equity_pool'] == epp0x) & df_aes['active']
-    #     if DCT_STATE['epp'].loc[epp0x, 'staked'] / df_aes.loc[epp_ix, 'notional'].sum() > .75:
-    #         df_aes.loc[df_aes['equity_pool'] == epp0x, 'mezz_coll'] = 0
-    #
-    # for aes in df_aes.itertuples():
-    #     if pd.notna(df_aes.loc[aes.id, 'mezz_coll']):
-    #         continue
-    #     if not df_aes.loc[aes.id, 'active']:
-    #         df_aes.loc[aes.id, 'mezz_coll'] = 0
-    #         continue
-    #     # Just b/c the marginal equity collateral at dt falls doesn't mean actual equity collateral fell!
-    #     marginal_eq_coll = req_eq_coll(aes.equity_pool, df_aes, dt) - req_eq_coll(
-    #         aes.equity_pool, df_aes[df_aes['id'] != aes.id], dt)
-    #     assert marginal_eq_coll >= 0, "Invalid marginal equity collateral."
-    #     num_aes_in_epp = np.maximum(0, df_aes['equity_pool'].eq(aes.equity_pool).sum() - 2)
-    #     min_coverage = np.maximum(DCT_STATE['min_coverage'], DCT_STATE['mc_power'] ** (- num_aes_in_epp))
-    #     df_aes.loc[aes.id, 'mezz_coll'] = np.maximum(0, min_coverage * aes.notional - marginal_eq_coll)
-    #
-    # if not DCT_STATE['aes'].empty:
-    #     DCT_STATE['aes'].loc[[i in df_aes.index for i in DCT_STATE['aes'].index], 'mezz_coll'] = df_aes['mezz_coll']
-    #
-    # return df_aes['mezz_coll']
 
 
 def mpp_token_value():
@@ -398,6 +362,7 @@ def execute_events(dt):
     df_events = df_aes[event_occurs].copy()
     if df_events.empty:
         return None
+    prev_req_mezz_coll = req_mezz_coll(df_aes, dt)
     df_aes.loc[event_occurs, 'active'] = False
     cfi = DCT_STATE['cashflow'].shape[0]
     DCT_STATE['cashflow'].loc[cfi, 'date'] = dt
@@ -410,30 +375,30 @@ def execute_events(dt):
                       f"EPP had ${equity_stake:.0f} staked.")
         df_aes.loc[event.id, 'excess_loss'] = -req_eq_coll(event.equity_pool, df_aes, dt) + req_eq_coll(
             event.equity_pool, df_aes[df_aes['id'] != event.id], dt) + df_aes.loc[event.id, 'notional']
-        df_aes.loc[df_aes['equity_pool'] == event.equity_pool, 'mezz_coll'] = np.nan
+        DCT_STATE['mezz_coll'].loc[event.equity_pool] = np.nan
         if pd.notna(DCT_STATE['cashflow'].loc[cfi, '0x']) and DCT_STATE['cashflow'].loc[cfi, '0x'] != event.equity_pool:
             cfi = DCT_STATE['cashflow'].shape[0]
             DCT_STATE['cashflow'].loc[cfi, 'date'] = dt
             DCT_STATE['cashflow'].loc[cfi, 'amount'] = 0
         DCT_STATE['cashflow'].loc[cfi, '0x'] = event.equity_pool
+        mc_size = DCT_STATE['mpp']['staked']
         if equity_stake >= event.notional:
             DCT_STATE['epp'].loc[event.equity_pool, 'staked'] -= event.notional
             DCT_STATE['cashflow'].loc[cfi, 'amount'] -= event.notional
-            epp_penalty = np.minimum(
-                event.notional * DCT_STATE['event_penalty'], DCT_STATE['epp'].loc[event.equity_pool, 'staked'])
-            if epp_penalty > 0:
-                DCT_STATE['epp'].loc[event.equity_pool, 'staked'] -= epp_penalty
-                DCT_STATE['cashflow'].loc[cfi, 'amount'] -= epp_penalty
-                DCT_STATE['mpp']['staked'] += epp_penalty
+            event_mpp_fee = np.minimum(
+                event.notional * DCT_STATE['event_mpp_fee'], DCT_STATE['epp'].loc[event.equity_pool, 'staked'])
+            if event_mpp_fee > 0:
+                DCT_STATE['epp'].loc[event.equity_pool, 'staked'] -= event_mpp_fee
+                DCT_STATE['cashflow'].loc[cfi, 'amount'] -= event_mpp_fee
+                DCT_STATE['mpp']['staked'] += event_mpp_fee
                 if cfm is None:
                     cfm = DCT_STATE['cashflow'].shape[0]
                     DCT_STATE['cashflow'].loc[cfm, 'date'] = dt
                     DCT_STATE['cashflow'].loc[cfm, '0x'] = 'mpp'
                     DCT_STATE['cashflow'].loc[cfm, 'amount'] = 0.
-                DCT_STATE['cashflow'].loc[cfm, 'amount'] += epp_penalty
+                DCT_STATE['cashflow'].loc[cfm, 'amount'] += event_mpp_fee
         else:
             mc_impairment = event.notional - equity_stake
-            mc_size = DCT_STATE['mpp']['staked']
             assert mc_size > mc_impairment, f"Insufficient mezzanine collateral to pay off {event.id}."
             DCT_STATE['epp'].loc[event.equity_pool, 'staked'] = 0.
             DCT_STATE['cashflow'].loc[cfi, 'amount'] -= DCT_STATE['epp'].loc[event.equity_pool, 'staked']
@@ -444,14 +409,18 @@ def execute_events(dt):
                 DCT_STATE['cashflow'].loc[cfm, 'amount'] = 0.
             DCT_STATE['mpp']['staked'] -= mc_impairment
             DCT_STATE['cashflow'].loc[cfm, 'amount'] -= mc_impairment
-            mezz_coll = req_mezz_coll(df_aes, dt)
-            mezz_cap_ratio = DCT_STATE['mpp']['staked'] / mezz_coll
             logging.warning(
                 f"Insufficient equity collateral to pay off event id {event.id}. "
-                f"Mezzanine collateral pool of ${mc_size:.0f} impaired by ${mc_impairment:.0f} "
-                f"({100 * mc_impairment / mc_size:.2f}% of pool). Capitalization ratio = {mezz_cap_ratio:.2f}")
-            if mezz_cap_ratio < DCT_STATE['recapitalization_threshold']:
-                recapitalize_mezz_pool(mezz_coll)
+                f"Mezzanine pool of ${mc_size:.0f} impaired by ${mc_impairment:.0f} "
+                f"({100 * mc_impairment / mc_size:.2f}% of pool)")
+        mezz_coll = req_mezz_coll(df_aes, dt)
+        if mezz_coll < 25000:
+            return
+        mezz_cap_ratio = mc_size / mezz_coll
+        logging.debug(f"Mezzanine required collateral went from ${prev_req_mezz_coll:.0f} to ${mezz_coll:.0f}. "
+                      f"Pool size = ${mc_size:.0f}. New capitalization ratio = {mezz_cap_ratio:.2f}")
+        if mezz_cap_ratio < DCT_STATE['recapitalization_threshold']:
+            recapitalize_mezz_pool(mezz_coll)
 
 
 def recapitalize_mezz_pool(mezz_coll):
