@@ -18,8 +18,10 @@ LST_VINTAGES = [datetime(2020, 3, 31), datetime(2020, 6, 30), datetime(2020, 9, 
                 datetime(2021, 3, 31)]
 START_DATE = datetime(2020, 1, 1)
 END_DATE = datetime(2021, 3, 31)
-NUM_EPP = 110
-MPP_SEED_FUND = 10000
+NUM_RANDOM = 50
+NUM_MALICIOUS = 6
+NUM_FAIR = 50
+MPP_SEED_FUND = 100000
 DCT_STATE = dict()
 PROJ_FOLDER = os.path.join(os.getenv('QRSHARE'),  "ProductDesign", "TFI", "OneOff", "data")
 
@@ -27,8 +29,8 @@ PROJ_FOLDER = os.path.join(os.getenv('QRSHARE'),  "ProductDesign", "TFI", "OneOf
 def main(argv):
     t0 = perf_counter()
     input_args = mu.arg_handler(argv, input_args=dict(
-        nu=0.005, ec_power=2., mc_power=1.5, ec_premium_mult=1.1, mc_premium_mult=1.1, ec_half_life=14, mc_half_life=7,
-        adv_fee_pct=0.0001, excess_loss_credit=0.5, event_mpp_fee=.1,
+        nu=0.005, ec_power=2., mc_power=2., ec_premium_markup=.1, ec_half_life=14, mc_half_life=3,
+        adv_fee_pct=0.0001, excess_loss_credit=0.5, event_mpp_fee=.05, min_prem_rate=.001,
         recapitalization_threshold=.9),
                                 name='OneOff/adventis_sim.py')
     mu.setup_logger(log_folder=os.path.join(os.getenv('QRSHARE'),  "ProductDesign", "TFI", "OneOff", "logs"),
@@ -36,33 +38,45 @@ def main(argv):
 
     logging.debug(f"Running with input_args={input_args}")
 
-    # Potential extension: model a malicious actor who deliberately sells cheap insurance to himself
-
     all_dates = pd.date_range(start=START_DATE, end=END_DATE)
     init_epp_capital = 1e6
     init_mpp_capital = 1e7
     DCT_STATE['epp'] = pd.concat(
         flatten([[pd.DataFrame(
-            {'bias': random.normalvariate(0, .5), 'noise': .05 * random.betavariate(2, 2), 'vintage': v,
-             'available': init_epp_capital, 'staked': 0, 'active': True},
-            index=[f'0xv{LST_VINTAGES.index(v)}e{i}']) for i in np.arange(NUM_EPP)] for v in LST_VINTAGES]))
-    DCT_STATE['adv_price'] = pd.Series(
-        index=all_dates, data=brownian(start_price=1., size=len(all_dates), bmu=0.001, sigma=.005))
-    DCT_STATE['pregen_rand'] = np.random.rand(1000000)
+            {'type': 'random', 'bias': random.normalvariate(.1, .5), 'noise': .05 * random.betavariate(2, 2),
+             'vintage': v, 'available': init_epp_capital, 'staked': 0, 'active': True},
+            index=[f'0xv{LST_VINTAGES.index(v)}e{i}rnd']) for i in np.arange(NUM_RANDOM)] for v in LST_VINTAGES]))
 
-    while os.path.exists(os.path.join(PROJ_FOLDER, "dct_state.pickle")):
+    DCT_STATE['epp'] = pd.concat([DCT_STATE['epp']] + flatten(
+        [[pd.DataFrame(
+            {'type': 'malicious', 'vintage': v, 'available': init_epp_capital, 'staked': 0, 'active': True},
+            index=[f'0xv{LST_VINTAGES.index(v)}e{i}mal']) for i in np.arange(NUM_MALICIOUS)] for v in LST_VINTAGES]))
+
+    DCT_STATE['epp'] = pd.concat([DCT_STATE['epp']] + flatten(
+        [[pd.DataFrame(
+            {'type': 'fair', 'vintage': v, 'available': init_epp_capital, 'staked': 0, 'active': True},
+            index=[f'0xv{LST_VINTAGES.index(v)}e{i}fai']) for i in np.arange(NUM_FAIR)] for v in LST_VINTAGES]))
+
+    # Load previously generated random values, so that runs with slightly different parameters are comparable
+    save_pickle = True
+    if os.path.exists(os.path.join(PROJ_FOLDER, "dct_state.pickle")):
         with open(os.path.join(PROJ_FOLDER, "dct_state.pickle"), 'rb') as pkl_handle:
             dct_state = pickle.load(pkl_handle)
-        if dct_state['epp'].shape != DCT_STATE['epp'].shape:
-            break
-        for a in DCT_STATE.keys():
-            DCT_STATE[a] = dct_state[a].copy()
-        DCT_STATE['pregen_aes'] = dct_state['aes'].copy()
-        DCT_STATE['epp'] = DCT_STATE['epp'].head(NUM_EPP * len(LST_VINTAGES))
-        DCT_STATE['epp']['available'] = init_epp_capital
-        DCT_STATE['epp']['staked'] = 0
-        DCT_STATE['epp']['active'] = True
-        break
+        if dct_state['epp'].shape == DCT_STATE['epp'].shape:
+            save_pickle = False
+            for k in dct_state.keys():
+                DCT_STATE[k] = dct_state[k].copy()
+
+    if save_pickle:
+        DCT_STATE['adv_price'] = pd.Series(
+            index=all_dates, data=brownian(start_price=1., size=len(all_dates), bmu=0.001, sigma=.005))
+        DCT_STATE['pregen_rand'] = np.random.rand(1000000)
+        DCT_STATE['pregen_aes'] = pd.concat([pd.DataFrame(index=[i], data={
+            'id': ''.join(random.choices(string.ascii_lowercase + string.digits, k=16)),
+            'hazard': 0.001 * random.random(),
+            'notional': random.randint(100, 10000)}) for i in np.arange(10000)]).drop_duplicates(subset=['id'])
+        with open(os.path.join(PROJ_FOLDER, "dct_state.pickle"), 'wb') as pkl_handle:
+            pickle.dump(DCT_STATE, pkl_handle)
 
     DCT_STATE['rand'] = DCT_STATE['pregen_rand'].copy()
     DCT_STATE['mpp'] = {'tokens': MPP_SEED_FUND, 'available': init_mpp_capital, 'staked': MPP_SEED_FUND}
@@ -72,10 +86,11 @@ def main(argv):
     DCT_STATE['n_adv_tokens'] = 1e7
     DCT_STATE['cashflow'] = pd.DataFrame(
         index=[0], data={'amount': -MPP_SEED_FUND, 'date': START_DATE, '0x': 'mpp', 'id': 0})
-    for a in input_args.keys():
-        DCT_STATE[a] = input_args[a]
+    for k in input_args.keys():
+        DCT_STATE[k] = input_args[k]
     DCT_STATE['ec_decay'] = - np.log(2) / DCT_STATE['ec_half_life']
     DCT_STATE['mc_decay'] = - np.log(2) / DCT_STATE['mc_half_life']
+    DCT_STATE['min_prem'] = -np.log(1 - DCT_STATE['min_prem_rate']) / 365  # Must charge at least min_prem_rate per year
     s_adv_avg_price = pd.concat(
         [pd.Series(data=[1.] * 30), DCT_STATE['adv_price']]).rolling(window=30).mean().tail(len(all_dates))
     DCT_STATE['adv_fee_tokens'] = pd.Series(data=np.nan, index=all_dates)
@@ -96,7 +111,11 @@ def main(argv):
                 continue
             for et in LST_TYPES:
                 mint_aes(dt=dt, vintage=v, event_type=et)
+
+        # Randomly generate event realizations and apply swap logic
         execute_events(dt)
+
+        # Recalculate mezzanine collateral requirements monthly
         if dt.day == 1:
             DCT_STATE['mezz_coll'] *= np.nan
 
@@ -119,7 +138,6 @@ def main(argv):
             DCT_STATE['mpp']['available'] += DCT_STATE['mpp_vintage_size'][dt]
             DCT_STATE['mpp']['staked'] -= DCT_STATE['mpp_vintage_size'][dt]
         s_mpp_token_value[dt] = mpp_token_value()
-    DCT_STATE['s_mpp_token_value'] = s_mpp_token_value
 
     # Final cash flow from what's left in MPP
     cfi = DCT_STATE['cashflow'].shape[0]
@@ -128,10 +146,7 @@ def main(argv):
     DCT_STATE['cashflow'].loc[cfi, 'id'] = 'end of simulation'
     DCT_STATE['cashflow'].loc[cfi, 'amount'] = DCT_STATE['mpp']['staked']
 
-    with open(os.path.join(PROJ_FOLDER, "dct_state.pickle"), 'wb') as pkl_handle:
-        pickle.dump(DCT_STATE, pkl_handle)
-
-    df_mpp = dct_state['s_mpp_token_value'].reset_index(name='value')
+    df_mpp = s_mpp_token_value.reset_index(name='value')
     df_mpp['eom'] = mu.eom(df_mpp['index'])
     df_mpp.drop_duplicates(keep='last', subset=['eom'])
 
@@ -146,9 +161,17 @@ def main(argv):
             logging.info(msg)
         else:
             logging.debug(msg)
-    epp_pnl = df_cf.loc[df_cf['0x'] != 'mpp', 'amount'].sum()
-    epp_inv = -df_cf.loc[(df_cf['0x'] != 'mpp') & (df_cf['amount'] < 0), 'amount'].sum()
-    logging.info(f"EPPs returned {100 * epp_pnl / epp_inv:.2f}%, ${epp_pnl:.0f} P&L on ${epp_inv:.0f}")
+    for epp_type in DCT_STATE['epp']['type'].unique():
+        type_0x = DCT_STATE['epp'][DCT_STATE['epp']['type'] == epp_type].index
+        type_ix = df_cf['0x'].isin(type_0x)
+        if not type_ix.any():
+            continue
+        epp_pnl = df_cf.loc[type_ix, 'amount'].sum()
+        epp_inv = -df_cf.loc[type_ix & (df_cf['amount'] < 0), 'amount'].sum()
+        df_aes = DCT_STATE['aes'].copy()
+        epp_paid = df_aes.loc[df_aes['equity_pool'].isin(type_0x) & (~df_aes['active']), 'notional'].sum()
+        logging.info(f"{epp_type.capitalize()} EPPs returned {100 * epp_pnl / epp_inv:.2f}%, "
+                     f"${epp_pnl:.0f} P&L on ${epp_inv:.0f} invested. Paid ${epp_paid:.0f}")
     logging.info(f"EPP wallets abandoned: {(~DCT_STATE['epp']['active']).sum()}")
     logging.info(f"ADV tokens burned: {1e7 - DCT_STATE['n_adv_tokens']:.0f}")
 
@@ -160,19 +183,45 @@ def main(argv):
 # ==================
 
 
+def random_epp(p_def_expiry, bias, noise):
+    return p_def_expiry * np.exp(random.normalvariate(bias, noise))
+
+
+def malicious_epp(p_def_expiry):
+    return np.minimum(0.001, p_def_expiry * 0.1)
+
+
+def fair_epp(p_def_expiry):
+    return p_def_expiry
+
+
+def epp_premium_func(p_def_expiry, epp_info):
+    if epp_info['type'] == 'random':
+        return random_epp(p_def_expiry, bias=epp_info['bias'], noise=epp_info['noise'])
+    elif epp_info['type'] == 'malicious':
+        return malicious_epp(p_def_expiry)
+    elif epp_info['type'] == 'fair':
+        return fair_epp(p_def_expiry)
+    else:
+        raise ValueError(f"Invalid EPP type {epp_info['type']}")
+
+
 def mint_aes(dt, vintage=None, event_type=None, notional=None, epp0x=None):
-    lst_v = [v for v in LST_VINTAGES if v > dt]
+    # Move on to next vintage when within 15 days of expiration
+    lst_v = [v for v in LST_VINTAGES if v > dt + pd.Timedelta(15, 'd')]
     if len(lst_v) == 0:
         return None
     if vintage is None:
         vintage = random.choice(lst_v)
+
     if event_type is None:
         event_type = random.choice(LST_TYPES)
+
     df_epp = DCT_STATE['epp'][(DCT_STATE['epp']['vintage'] == vintage) & DCT_STATE['epp']['active']]
     if epp0x is None:
         epp0x = random.choice(df_epp.index)
 
-    if ('pregen_aes' in DCT_STATE.keys()) and (DCT_STATE['aes'].shape[0] < DCT_STATE['pregen_aes'].shape[0]):
+    if DCT_STATE['aes'].shape[0] < DCT_STATE['pregen_aes'].shape[0]:
         dct_aes = DCT_STATE['pregen_aes'].iloc[DCT_STATE['aes'].shape[0], :].to_dict()
         id16 = dct_aes['id']
         hazard = dct_aes['hazard']
@@ -187,15 +236,16 @@ def mint_aes(dt, vintage=None, event_type=None, notional=None, epp0x=None):
     p_def_dt = 1 - np.exp(-hazard)
     days_to_expiry = (vintage - dt).days
     p_def_expiry = 1 - np.exp(-hazard * days_to_expiry)
-    premium_pct = p_def_expiry * np.exp(random.normalvariate(df_epp.loc[epp0x, 'bias'], df_epp.loc[epp0x, 'noise']))
-    dct_aes = {'id': id16, 'type': event_type, 'date_created': dt, 'vintage': vintage,
+    premium_pct = np.maximum(epp_premium_func(p_def_expiry, DCT_STATE['epp'].loc[epp0x]),
+                             1 - np.exp(-DCT_STATE['min_prem'] * days_to_expiry))
+    dct_aes = {'type': event_type, 'date_created': dt, 'vintage': vintage,
                'active': True, 'excess_loss': np.nan,
-               'notional': notional, 'hazard': hazard, 'p_def': p_def_expiry, 'p_def_dt': p_def_dt,
+               'notional': notional, 'p_def': p_def_expiry, 'p_def_dt': p_def_dt,
                'premium_pct': premium_pct, 'equity_pool': epp0x}
 
     # Calculate collateral requirements
     df_aes = DCT_STATE['aes'].copy()
-    for v in ['notional', 'equity_pool', 'active', 'excess_loss', 'date_created', 'premium_pct', 'id', 'vintage']:
+    for v in ['notional', 'equity_pool', 'active', 'excess_loss', 'date_created', 'premium_pct', 'vintage']:
         df_aes.loc[id16, v] = dct_aes[v]
     eq_coll = req_eq_coll(epp0x, df_aes, dt)
     mezz_coll = req_mezz_coll(df_aes, dt, new_eq_coll=pd.Series(index=[epp0x], data=[eq_coll]))
@@ -217,8 +267,8 @@ def mint_aes(dt, vintage=None, event_type=None, notional=None, epp0x=None):
         # Add new EPP wallet with same parameters
         new_epp = DCT_STATE['epp'].loc[[epp0x]].copy()
         new_epp['staked'] = 0.
-        new_epp.index = [f"0xv{LST_VINTAGES.index(vintage)}e"
-                         f"{DCT_STATE['epp'][DCT_STATE['epp']['vintage'] == vintage].shape[0]}"]
+        new_0x = f"0xv{LST_VINTAGES.index(vintage)}e{DCT_STATE['epp'][DCT_STATE['epp']['vintage'] == vintage].shape[0]}"
+        new_epp.index = [new_0x]
         DCT_STATE['epp'] = pd.concat([DCT_STATE['epp'], new_epp])
         DCT_STATE['epp'].loc[epp0x, 'active'] = False
         return mint_aes(dt, vintage, event_type, notional, epp0x=new_epp.index[0])
@@ -260,17 +310,19 @@ def mint_aes(dt, vintage=None, event_type=None, notional=None, epp0x=None):
     return dct_aes
 
 
-def req_coll(epp0x, df_aes, dt, decay, power, premium_mult, excess_loss_credit):
+def req_coll(epp0x, df_aes, dt, decay, power, premium_markup, excess_loss_credit):
     """
     Computes required collateral by EPP
 
-    Sort all active AES written by epp0x. For each AES, equity collateral is highest of:
-        1. Exponential decay as a function of time since AES was created
+    Sort all active AES written by epp0x. For each AES, equity collateral is notional times the highest of:
+        1. Exponential decay from 100% as a function of time since AES was created
         2. Power function of sort order.
-        3. Fixed multiple of premium.
+        3. Fixed markup over premium.
         4. Minimum collateral per contract parameter (nu).
 
-    Final amount is the sum across all AES contracts, less a collateral credit for excess losses incurred by the EPP.
+    Final amount is the sum across all AES contracts, less a collateral credit for excess losses incurred.
+
+    Potential extension: take into account diversification across event types
 
     Parameters
     ----------
@@ -280,36 +332,44 @@ def req_coll(epp0x, df_aes, dt, decay, power, premium_mult, excess_loss_credit):
         DataFrame of all Adverse Event Swaps
     dt : datetime
         Current date for evaluating collateral (used for calculating decay since date AES created).
-    decay
-    power
-    premium_mult
-    excess_loss_credit
+    decay : float
+        Exponential decay parameter.
+    power : float
+        Power function base.
+    premium_markup : float
+        Markup on premium setting minimum collateral.
+    excess_loss_credit : float
+        Factor applied to excess losses as a collateral credit.
 
     Returns
     -------
     float
-        Required equity collateral amount.
+        Required collateral amount.
     """
-    # Potential extension: take into account diversification across event types
-    if df_aes.empty:
-        return 0
-
-    ix = df_aes['equity_pool'] == epp0x
-    excess_loss = df_aes.loc[ix & ~df_aes['active'], 'excess_loss'].sum()
-    df_active = df_aes[ix & df_aes['active']].sort_values(by='notional', ascending=False).reset_index(drop=True)
+    epp_ix = df_aes['equity_pool'] == epp0x
+    epp_ix_active = epp_ix & df_aes['active']
+    if sum(epp_ix_active) == 1:
+        return df_aes.loc[epp_ix_active, 'notional'].iloc[0]
+    excess_loss = 0
+    if excess_loss_credit > 0:
+        excess_loss = df_aes.loc[epp_ix & ~df_aes['active'], 'excess_loss'].sum()
+    df_active = df_aes[epp_ix & df_aes['active']].sort_values(by='notional', ascending=False).reset_index(drop=True)
     coll = (np.max([np.exp(decay * (dt - df_active['date_created']).dt.days).values,
                     power ** (- df_active.index).values,
-                    premium_mult * df_active['premium_pct'].values,
+                    (1 + premium_markup) * df_active['premium_pct'].values,
                     DCT_STATE['nu'] * np.ones(df_active.shape[0])], axis=0) * df_active['notional'].values).sum()
 
     return coll - excess_loss_credit * np.minimum(coll, excess_loss)
 
 
 def req_eq_coll(epp0x, df_aes, dt):
+    if df_aes.empty:
+        return 0
+
     return req_coll(epp0x, df_aes[df_aes['vintage'] > dt], dt,
                     decay=DCT_STATE['ec_decay'],
                     power=DCT_STATE['ec_power'],
-                    premium_mult=DCT_STATE['ec_premium_mult'],
+                    premium_markup=DCT_STATE['ec_premium_markup'],
                     excess_loss_credit=DCT_STATE['excess_loss_credit'])
 
 
@@ -335,7 +395,7 @@ def req_mezz_coll(df_aes, dt, new_eq_coll=None):
             epp0x, df_aes, dt,
             decay=DCT_STATE['mc_decay'],
             power=DCT_STATE['mc_power'],
-            premium_mult=DCT_STATE['mc_premium_mult'],
+            premium_markup=0,
             excess_loss_credit=0) - df_coll.loc[epp0x, 'eq'])
 
     s_mc = pd.concat([DCT_STATE['mezz_coll'], df_coll['mezz']])
@@ -370,11 +430,11 @@ def execute_events(dt):
     cfm = None
     for event in df_events.itertuples():
         equity_stake = DCT_STATE['epp'].loc[event.equity_pool, 'staked']
-        logging.debug(f"{event.type.capitalize()} event with id {event.id} occurred at {dt:%Y-%m-%d}. "
+        logging.debug(f"{event.type.capitalize()} event with id {event.Index} occurred at {dt:%Y-%m-%d}. "
                       f"Equity pool {event.equity_pool} is impaired by ${event.notional:.0f}. "
                       f"EPP had ${equity_stake:.0f} staked.")
-        df_aes.loc[event.id, 'excess_loss'] = -req_eq_coll(event.equity_pool, df_aes, dt) + req_eq_coll(
-            event.equity_pool, df_aes[df_aes['id'] != event.id], dt) + df_aes.loc[event.id, 'notional']
+        df_aes.loc[event.Index, 'excess_loss'] = -req_eq_coll(event.equity_pool, df_aes, dt) + req_eq_coll(
+            event.equity_pool, df_aes[df_aes.index != event.Index], dt) + df_aes.loc[event.Index, 'notional']
         DCT_STATE['mezz_coll'].loc[event.equity_pool] = np.nan
         if pd.notna(DCT_STATE['cashflow'].loc[cfi, '0x']) and DCT_STATE['cashflow'].loc[cfi, '0x'] != event.equity_pool:
             cfi = DCT_STATE['cashflow'].shape[0]
@@ -398,8 +458,8 @@ def execute_events(dt):
                     DCT_STATE['cashflow'].loc[cfm, 'amount'] = 0.
                 DCT_STATE['cashflow'].loc[cfm, 'amount'] += event_mpp_fee
         else:
-            mc_impairment = event.notional - equity_stake
-            assert mc_size > mc_impairment, f"Insufficient mezzanine collateral to pay off {event.id}."
+            mc_loss = event.notional - equity_stake
+            assert mc_size > mc_loss, f"Insufficient mezzanine collateral to pay off {event.Index}."
             DCT_STATE['epp'].loc[event.equity_pool, 'staked'] = 0.
             DCT_STATE['cashflow'].loc[cfi, 'amount'] -= DCT_STATE['epp'].loc[event.equity_pool, 'staked']
             if cfm is None:
@@ -407,12 +467,11 @@ def execute_events(dt):
                 DCT_STATE['cashflow'].loc[cfm, 'date'] = dt
                 DCT_STATE['cashflow'].loc[cfm, '0x'] = 'mpp'
                 DCT_STATE['cashflow'].loc[cfm, 'amount'] = 0.
-            DCT_STATE['mpp']['staked'] -= mc_impairment
-            DCT_STATE['cashflow'].loc[cfm, 'amount'] -= mc_impairment
+            DCT_STATE['mpp']['staked'] -= mc_loss
+            DCT_STATE['cashflow'].loc[cfm, 'amount'] -= mc_loss
             logging.warning(
-                f"Insufficient equity collateral to pay off event id {event.id}. "
-                f"Mezzanine pool of ${mc_size:.0f} impaired by ${mc_impairment:.0f} "
-                f"({100 * mc_impairment / mc_size:.2f}% of pool)")
+                f"Insufficient equity to pay off {event.Index}. Mezzanine pool of ${mc_size:.0f} lost ${mc_loss:.0f} "
+                f"({100 * mc_loss / mc_size:.2f}%)")
         mezz_coll = req_mezz_coll(df_aes, dt)
         if mezz_coll < 25000:
             return
