@@ -18,9 +18,9 @@ LST_VINTAGES = [datetime(2020, 3, 31), datetime(2020, 6, 30), datetime(2020, 9, 
                 datetime(2021, 3, 31)]
 START_DATE = datetime(2020, 1, 1)
 END_DATE = datetime(2021, 3, 31)
-NUM_RANDOM = 50
-NUM_MALICIOUS = 6
-NUM_FAIR = 50
+NUM_RANDOM = 20
+NUM_MALICIOUS = 3
+NUM_FAIR = 60
 MPP_SEED_FUND = 100000
 DCT_STATE = dict()
 PROJ_FOLDER = os.path.join(os.getenv('QRSHARE'),  "ProductDesign", "TFI", "OneOff", "data")
@@ -29,21 +29,26 @@ PROJ_FOLDER = os.path.join(os.getenv('QRSHARE'),  "ProductDesign", "TFI", "OneOf
 def main(argv):
     t0 = perf_counter()
     input_args = mu.arg_handler(argv, input_args=dict(
-        nu=0.005, ec_power=2., mc_power=2., ec_premium_markup=.1, ec_half_life=14, mc_half_life=3,
-        adv_fee_pct=0.0001, excess_loss_credit=0.5, event_mpp_fee=.05, min_prem_rate=.001,
-        recapitalization_threshold=.9),
+        nu=0.005, ec_power=2.5, mc_power=2., ec_premium_markup=.1, ec_half_life=14, mc_half_life=3,
+        excess_loss_credit=0.5, event_mpp_fee=.1, min_prem_rate=.001, recapitalization_threshold=.9,
+        adv_fee_pct=0.0001, oracle_fee=0., run_auction=False),
                                 name='OneOff/adventis_sim.py')
     mu.setup_logger(log_folder=os.path.join(os.getenv('QRSHARE'),  "ProductDesign", "TFI", "OneOff", "logs"),
                     filename=os.path.basename(__file__)[:-3], console_level=logging.INFO)
 
     logging.debug(f"Running with input_args={input_args}")
+    if input_args['run_auction']:
+        for _ in np.arange(200):
+            auction_simulator(True)
+        logging.info(f"Done. Time to run: {timedelta(seconds=perf_counter() - t0)}")
+        return
 
     all_dates = pd.date_range(start=START_DATE, end=END_DATE)
     init_epp_capital = 1e6
     init_mpp_capital = 1e7
     DCT_STATE['epp'] = pd.concat(
         flatten([[pd.DataFrame(
-            {'type': 'random', 'bias': random.normalvariate(.1, .5), 'noise': .05 * random.betavariate(2, 2),
+            {'type': 'random', 'bias': random.normalvariate(.75, .5), 'noise': .05 * random.betavariate(2, 2),
              'vintage': v, 'available': init_epp_capital, 'staked': 0, 'active': True},
             index=[f'0xv{LST_VINTAGES.index(v)}e{i}rnd']) for i in np.arange(NUM_RANDOM)] for v in LST_VINTAGES]))
 
@@ -70,10 +75,10 @@ def main(argv):
     if save_pickle:
         DCT_STATE['adv_price'] = pd.Series(
             index=all_dates, data=brownian(start_price=1., size=len(all_dates), bmu=0.001, sigma=.005))
-        DCT_STATE['pregen_rand'] = np.random.rand(1000000)
+        DCT_STATE['pregen_rand'] = np.random.rand(2000000)
         DCT_STATE['pregen_aes'] = pd.concat([pd.DataFrame(index=[i], data={
             'id': ''.join(random.choices(string.ascii_lowercase + string.digits, k=16)),
-            'hazard': 0.001 * random.random(),
+            'p_def_expiry': 0.15 * random.random(),
             'notional': random.randint(100, 10000)}) for i in np.arange(10000)]).drop_duplicates(subset=['id'])
         with open(os.path.join(PROJ_FOLDER, "dct_state.pickle"), 'wb') as pkl_handle:
             pickle.dump(DCT_STATE, pkl_handle)
@@ -106,11 +111,12 @@ def main(argv):
 
     for dt in all_dates:
         logging.debug(f"Running simulation for date {dt:%Y-%m-%d}")
-        for v in LST_VINTAGES:
-            if dt >= v:
-                continue
-            for et in LST_TYPES:
-                mint_aes(dt=dt, vintage=v, event_type=et)
+        for et in LST_TYPES:
+            mint_aes(dt=dt, event_type=et)
+            mint_aes(dt=dt, event_type=et)
+            mint_aes(dt=dt, event_type=et)
+            mint_aes(dt=dt, event_type=et)
+            mint_aes(dt=dt, event_type=et)
 
         # Randomly generate event realizations and apply swap logic
         execute_events(dt)
@@ -156,7 +162,7 @@ def main(argv):
         inv = - df_cf.loc[(df_cf['0x'] == x) & (df_cf['amount'] < 0), 'amount'].sum()
         if inv == 0:
             continue
-        msg = f"Returned {100 * pnl / inv:.2f}%, ${pnl:.0f} P&L on net invested capital ${inv:.0f} for {x}"
+        msg = f"Returned {100 * pnl / inv:.2f}%, ${pnl:,.0f} P&L on net invested capital ${inv:,.0f} for {x}"
         if x == 'mpp':
             logging.info(msg)
         else:
@@ -171,7 +177,9 @@ def main(argv):
         df_aes = DCT_STATE['aes'].copy()
         epp_paid = df_aes.loc[df_aes['equity_pool'].isin(type_0x) & (~df_aes['active']), 'notional'].sum()
         logging.info(f"{epp_type.capitalize()} EPPs returned {100 * epp_pnl / epp_inv:.2f}%, "
-                     f"${epp_pnl:.0f} P&L on ${epp_inv:.0f} invested. Paid ${epp_paid:.0f}")
+                     f"${epp_pnl:,.0f} P&L on ${epp_inv:,.0f} invested. Paid ${epp_paid:,.0f}")
+    mu.df_to_files(df_cf, os.path.join(os.getenv('QRSHARE'),  "ProductDesign", "TFI", "OneOff", "data", "adventis_cf"),
+                   to_csv=False, to_feather=False)
     logging.info(f"EPP wallets abandoned: {(~DCT_STATE['epp']['active']).sum()}")
     logging.info(f"ADV tokens burned: {1e7 - DCT_STATE['n_adv_tokens']:.0f}")
 
@@ -183,25 +191,25 @@ def main(argv):
 # ==================
 
 
-def random_epp(p_def_expiry, bias, noise):
-    return p_def_expiry * np.exp(random.normalvariate(bias, noise))
+def random_epp(p, bias, noise):
+    return p * np.exp(random.normalvariate(bias, noise))
 
 
-def malicious_epp(p_def_expiry):
-    return np.minimum(0.001, p_def_expiry * 0.1)
+def malicious_epp(p):
+    return np.minimum(0.001, p * 0.1)
 
 
-def fair_epp(p_def_expiry):
-    return p_def_expiry
+def fair_epp(p):
+    return p
 
 
-def epp_premium_func(p_def_expiry, epp_info):
+def epp_premium_func(p, epp_info):
     if epp_info['type'] == 'random':
-        return random_epp(p_def_expiry, bias=epp_info['bias'], noise=epp_info['noise'])
+        return random_epp(p, bias=epp_info['bias'], noise=epp_info['noise'])
     elif epp_info['type'] == 'malicious':
-        return malicious_epp(p_def_expiry)
+        return malicious_epp(p)
     elif epp_info['type'] == 'fair':
-        return fair_epp(p_def_expiry)
+        return fair_epp(p)
     else:
         raise ValueError(f"Invalid EPP type {epp_info['type']}")
 
@@ -224,18 +232,21 @@ def mint_aes(dt, vintage=None, event_type=None, notional=None, epp0x=None):
     if DCT_STATE['aes'].shape[0] < DCT_STATE['pregen_aes'].shape[0]:
         dct_aes = DCT_STATE['pregen_aes'].iloc[DCT_STATE['aes'].shape[0], :].to_dict()
         id16 = dct_aes['id']
-        hazard = dct_aes['hazard']
+        p_def_expiry = dct_aes['p_def_expiry']
         notional = dct_aes['notional']
     else:
         id16 = ''.join(random.choices(string.ascii_lowercase + string.digits, k=16))
         while not DCT_STATE['aes'].empty and id16 in DCT_STATE['aes']['id'].tolist():
             id16 = ''.join(random.choices(string.ascii_lowercase + string.digits, k=16))
-        hazard = 0.001 * random.random()
+        p_def_expiry = 0.15 * random.random()
         if notional is None:
             notional = random.randint(100, 10000)
-    p_def_dt = 1 - np.exp(-hazard)
     days_to_expiry = (vintage - dt).days
-    p_def_expiry = 1 - np.exp(-hazard * days_to_expiry)
+    hazard = - np.log(1 - p_def_expiry) / days_to_expiry
+    if DCT_STATE['epp'].loc[epp0x, 'type'] == 'malicious':
+        hazard *= 10
+        p_def_expiry = 1 - np.exp(-hazard * days_to_expiry)
+    p_def_dt = 1 - np.exp(-hazard)
     premium_pct = np.maximum(epp_premium_func(p_def_expiry, DCT_STATE['epp'].loc[epp0x]),
                              1 - np.exp(-DCT_STATE['min_prem'] * days_to_expiry))
     dct_aes = {'type': event_type, 'date_created': dt, 'vintage': vintage,
@@ -285,16 +296,16 @@ def mint_aes(dt, vintage=None, event_type=None, notional=None, epp0x=None):
 
     df_cf = DCT_STATE['cashflow']
     cfie = df_cf.shape[0]
-    df_cf.loc[cfie, 'amount'] = premium_amt - addl_eq_coll - adv_fee
+    df_cf.loc[cfie, 'amount'] = - addl_eq_coll - adv_fee
     df_cf.loc[cfie, 'date'] = dt
     df_cf.loc[cfie, '0x'] = epp0x
-    df_cf.loc[cfie, 'id'] = id16
+    df_cf.loc[cfie, 'id'] = f"mint {id16}"
     cfim = df_cf.shape[0]
     if addl_mezz_coll > 0:
         df_cf.loc[cfim, 'amount'] = - np.maximum(0, addl_mezz_coll)
         df_cf.loc[cfim, 'date'] = dt
         df_cf.loc[cfim, '0x'] = 'mpp'
-        df_cf.loc[cfim, 'id'] = id16
+        df_cf.loc[cfim, 'id'] = f"mint {id16}"
 
     # Mezzanine collateral requirements
     assert DCT_STATE['mpp']['available'] > addl_mezz_coll, "MPP has insufficient inactive capital to execute a new AES."
@@ -420,6 +431,7 @@ def execute_events(dt):
     # Potential extension: event occurrence can be correlated across time and within events
     event_occurs = (df_aes['p_def_dt'] > random_input) & df_aes['active']
     df_events = df_aes[event_occurs].copy()
+    df_active = df_aes[df_aes['active']].copy()
     if df_events.empty:
         return None
     prev_req_mezz_coll = req_mezz_coll(df_aes, dt)
@@ -427,12 +439,13 @@ def execute_events(dt):
     cfi = DCT_STATE['cashflow'].shape[0]
     DCT_STATE['cashflow'].loc[cfi, 'date'] = dt
     DCT_STATE['cashflow'].loc[cfi, 'amount'] = 0
+    DCT_STATE['cashflow'].loc[cfi, 'id'] = "event payoff"
     cfm = None
     for event in df_events.itertuples():
         equity_stake = DCT_STATE['epp'].loc[event.equity_pool, 'staked']
         logging.debug(f"{event.type.capitalize()} event with id {event.Index} occurred at {dt:%Y-%m-%d}. "
-                      f"Equity pool {event.equity_pool} is impaired by ${event.notional:.0f}. "
-                      f"EPP had ${equity_stake:.0f} staked.")
+                      f"Equity pool {event.equity_pool} is impaired by ${event.notional:,.0f}. "
+                      f"EPP had ${equity_stake:,.0f} staked.")
         df_aes.loc[event.Index, 'excess_loss'] = -req_eq_coll(event.equity_pool, df_aes, dt) + req_eq_coll(
             event.equity_pool, df_aes[df_aes.index != event.Index], dt) + df_aes.loc[event.Index, 'notional']
         DCT_STATE['mezz_coll'].loc[event.equity_pool] = np.nan
@@ -440,6 +453,7 @@ def execute_events(dt):
             cfi = DCT_STATE['cashflow'].shape[0]
             DCT_STATE['cashflow'].loc[cfi, 'date'] = dt
             DCT_STATE['cashflow'].loc[cfi, 'amount'] = 0
+            DCT_STATE['cashflow'].loc[cfi, 'id'] = "event payoff"
         DCT_STATE['cashflow'].loc[cfi, '0x'] = event.equity_pool
         mc_size = DCT_STATE['mpp']['staked']
         if equity_stake >= event.notional:
@@ -447,6 +461,9 @@ def execute_events(dt):
             DCT_STATE['cashflow'].loc[cfi, 'amount'] -= event.notional
             event_mpp_fee = np.minimum(
                 event.notional * DCT_STATE['event_mpp_fee'], DCT_STATE['epp'].loc[event.equity_pool, 'staked'])
+            equity_total_notional = df_active.loc[df_active['equity_pool'] == event.equity_pool, 'notional'].sum()
+            if equity_stake == equity_total_notional:
+                event_mpp_fee = 0
             if event_mpp_fee > 0:
                 DCT_STATE['epp'].loc[event.equity_pool, 'staked'] -= event_mpp_fee
                 DCT_STATE['cashflow'].loc[cfi, 'amount'] -= event_mpp_fee
@@ -456,6 +473,7 @@ def execute_events(dt):
                     DCT_STATE['cashflow'].loc[cfm, 'date'] = dt
                     DCT_STATE['cashflow'].loc[cfm, '0x'] = 'mpp'
                     DCT_STATE['cashflow'].loc[cfm, 'amount'] = 0.
+                    DCT_STATE['cashflow'].loc[cfm, 'id'] = "event payoff"
                 DCT_STATE['cashflow'].loc[cfm, 'amount'] += event_mpp_fee
         else:
             mc_loss = event.notional - equity_stake
@@ -467,17 +485,18 @@ def execute_events(dt):
                 DCT_STATE['cashflow'].loc[cfm, 'date'] = dt
                 DCT_STATE['cashflow'].loc[cfm, '0x'] = 'mpp'
                 DCT_STATE['cashflow'].loc[cfm, 'amount'] = 0.
+                DCT_STATE['cashflow'].loc[cfm, 'id'] = "event payoff"
             DCT_STATE['mpp']['staked'] -= mc_loss
             DCT_STATE['cashflow'].loc[cfm, 'amount'] -= mc_loss
             logging.warning(
-                f"Insufficient equity to pay off {event.Index}. Mezzanine pool of ${mc_size:.0f} lost ${mc_loss:.0f} "
-                f"({100 * mc_loss / mc_size:.2f}%)")
+                f"Insufficient equity to pay off {event.Index}. Mezzanine pool of ${mc_size:,.0f} lost ${mc_loss:,.0f} "
+                f"({100 * mc_loss / mc_size:.2f}%). EPP type: {DCT_STATE['epp'].loc[event.equity_pool, 'type']}.")
         mezz_coll = req_mezz_coll(df_aes, dt)
         if mezz_coll < 25000:
             return
         mezz_cap_ratio = mc_size / mezz_coll
-        logging.debug(f"Mezzanine required collateral went from ${prev_req_mezz_coll:.0f} to ${mezz_coll:.0f}. "
-                      f"Pool size = ${mc_size:.0f}. New capitalization ratio = {mezz_cap_ratio:.2f}")
+        logging.debug(f"Mezzanine required collateral went from ${prev_req_mezz_coll:,.0f} to ${mezz_coll:,.0f}. "
+                      f"Pool size = ${mc_size:,.0f}. New capitalization ratio = {mezz_cap_ratio:.2f}")
         if mezz_cap_ratio < DCT_STATE['recapitalization_threshold']:
             recapitalize_mezz_pool(mezz_coll)
 
@@ -514,6 +533,127 @@ def xirr(cashflows, guess=0.1):
 
 def xirr_df(df_cf, guess=0.1):
     return xirr([(tpl.date, tpl.amount) for tpl in df_cf.itertuples()], guess)
+
+
+def auction_simulator(speculative=False, df_orders=None):
+    """
+    Simulate the auction round of an AES
+
+    Parameters
+    ----------
+    speculative : bool
+        Is the proposal speculative or a real proposed trade
+    df_orders : pd.DataFrame
+        Price, amount, and side of orders. Side in {'b', 'o', 'p'} for bid, offers, and proposal, respectively.
+        Generate randomly if not provided.
+    """
+    tick = 0.0025
+
+    # Combined DF with bids (b), offers (o), and proposal (p)
+    if df_orders is None:
+        num_orders = random.randint(1, 50)
+        df_orders = pd.DataFrame({
+            'price': tick * np.random.randint(1, int(.15 / tick), num_orders),
+            'amount': np.random.randint(1, 100, num_orders),
+            'side': np.random.choice(['b', 'o'], num_orders)})
+        df_orders.loc[0, 'side'] = 'p'
+    df_orders['price'] = np.round(df_orders['price'], 4)
+    bids = df_orders['side'] == 'b'
+    offers = df_orders['side'] == 'o'
+    num_bids = sum(bids)
+    df_orders['fill'] = np.nan
+
+    if num_bids == 0:
+        logging.info(f"No alternative buyers. Proposed trade goes through.")
+        df_orders.loc[0, 'fill'] = 0 if speculative else df_orders.loc[0, 'amount']
+        df_orders.loc[0, 'buy_fill'] = 0 if speculative else df_orders.loc[0, 'amount']
+        return df_orders
+    
+    # Cumulate bids and offers into bid and ask order books
+    df_bidbook = df_orders[df_orders['side'] == 'b'].groupby('price')['amount'].sum().sort_index(
+        ascending=False).to_frame()
+    df_bidbook.index = [f'{x:.4f}' for x in df_bidbook.index]
+    df_bidbook['cum_amount'] = df_bidbook['amount'].cumsum()
+    df_all_offers = df_orders[df_orders['side'] != 'b'].copy()
+    df_all_offers.loc[0, 'price'] += tick  # Proposal is included as an offer at 1 tick above proposed price
+    df_all_offers['price'] = [f'{x:.4f}' for x in df_all_offers['price']]
+    df_askbook = df_all_offers.groupby('price')['amount'].sum().to_frame()
+    df_askbook['cum_amount'] = df_askbook['amount'].cumsum()
+
+    # Generate combined order book
+    df_book = pd.DataFrame(index=tick * (1 + np.arange(int(.15 / tick))))
+    df_book.index = [f'{x:.4f}' for x in df_book.index]
+    df_book['cum_bid'] = df_bidbook['cum_amount']
+    df_book['cum_ask'] = df_askbook['cum_amount']
+    df_book['cum_bid'].bfill(inplace=True)
+    df_book['cum_ask'].ffill(inplace=True)
+
+    # Check for bids higher than the lowest offer
+    if not df_book['cum_bid'].le(df_book['cum_ask']).any():
+        logging.info("Only very low bids entered. Proposed trade goes through.")
+        df_orders.loc[0, 'fill'] = 0 if speculative else df_orders.loc[0, 'amount']
+        df_orders.loc[0, 'buy_fill'] = 0 if speculative else df_orders.loc[0, 'amount']
+        return
+    
+    # Results of double auction
+    mkt_price = df_book.index[df_book['cum_bid'] <= df_book['cum_ask']][0]
+    mkt_volume = df_book.loc[mkt_price, 'cum_bid']
+    excess_offers = df_book.loc[mkt_price, 'cum_ask'] - mkt_volume
+    mkt_price = float(mkt_price)
+    
+    # Calculate fills of bids
+    df_orders.loc[bids, 'fill'] = 0
+    df_orders.loc[(df_orders['price'] - mkt_price > -1e-4) & bids, 'fill'] = df_orders['amount']
+
+    # Determine whether proposed trade goes through
+    if mkt_volume < df_orders.loc[0, 'amount']:
+        logging.info("Insufficient bidding above proposed price. Proposed trade goes through.")
+        df_orders.loc[0, 'fill'] = mkt_volume if speculative else df_orders.loc[0, 'amount']
+        df_orders.loc[0, 'buy_fill'] = 0 if speculative else df_orders.loc[0, 'amount']
+        if speculative:
+            df_orders.loc[(df_orders['price'] - mkt_price > -1e-4) & bids, 'fill'] = df_orders['amount']
+        return
+    if mkt_price - df_orders.loc[0, 'price'] > 1e-4:
+        logging.info(f"Market clearing price ({mkt_price:.4f}) is higher than proposal ({df_orders.loc[0, 'price']}). "
+                     "Original EPP is filled at a higher price. "
+                     "Original buyer is not filled.")
+        df_orders.loc[0, 'fill'] = df_orders.loc[0, 'amount']
+        df_orders.loc[0, 'buy_fill'] = 0
+    elif mkt_price - df_orders.loc[0, 'price'] < -1e-4:
+        logging.info(f"Market clearing price ({mkt_price:.4f}) is lower than proposal ({df_orders.loc[0, 'price']}). "
+                     f"Proposed trade goes through.")
+        df_orders.loc[0, 'fill'] = 0 if speculative else df_orders.loc[0, 'amount']
+        df_orders.loc[0, 'buy_fill'] = 0 if speculative else df_orders.loc[0, 'amount']
+    else:
+        logging.info("Market clearing price equals proposal. Proposed trade goes through.")
+        df_orders.loc[0, 'fill'] = df_orders.loc[0, 'amount']
+        df_orders.loc[0, 'buy_fill'] = 0 if speculative else df_orders.loc[0, 'amount']
+        if speculative:
+            excess_offers += df_orders.loc[0, 'amount']
+
+    # Calculate fills of offers
+    offer_full_fill = df_askbook.index[df_askbook['cum_amount'] <= mkt_volume - df_orders.loc[0, 'fill']]
+    df_orders.loc[df_orders['price'].isin(offer_full_fill) & offers, 'fill'] = df_orders['amount']
+    offer_partial_fill = df_orders['fill'].isna() & (df_orders['price'] - mkt_price < 1e-4)
+    offer_partial_fill_ratio = 1 - excess_offers / df_orders.loc[offer_partial_fill, 'amount'].sum()
+    df_orders.loc[offer_partial_fill, 'fill'] = offer_partial_fill_ratio * df_orders['amount']
+    df_orders['fill'].fillna(0, inplace=True)
+
+    # Resubmit low price offers that brough down market prices as a disincentive to skewing prices by submitting large
+    # offers at low prices
+    if mkt_price - df_orders.loc[0, 'price'] < -1e-4:
+        df_next_proposal = df_orders[offer_partial_fill].copy()
+        df_next_proposal['amount'] -= df_next_proposal['fill']
+        df_next_proposal = df_next_proposal.groupby('price')['amount'].sum().reset_index().head(1)
+        logging.info(f"Lowest price partial fills submitted as speculative proposal in the next auction.\n"
+                     f"{df_next_proposal}")
+
+    # Verify bid/offer fills match
+    ofill = df_orders.loc[offers, 'fill'].sum() + df_orders.loc[0, 'fill']
+    bfill = df_orders.loc[bids, 'fill'].sum() + df_orders.loc[0, 'buy_fill']
+    assert abs(ofill - bfill) < 1e-6, f"Bid filled != offer filled, bid={bfill} offer={ofill}"
+
+    return df_orders
 
 
 if __name__ == "__main__":
