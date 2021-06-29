@@ -38,8 +38,8 @@ def main(argv):
 
     logging.debug(f"Running with input_args={input_args}")
     if input_args['run_auction']:
-        for _ in np.arange(200):
-            auction_simulator(True)
+        for _ in np.arange(500):
+            auction_simulator()
         logging.info(f"Done. Time to run: {timedelta(seconds=perf_counter() - t0)}")
         return
 
@@ -535,21 +535,29 @@ def xirr_df(df_cf, guess=0.1):
     return xirr([(tpl.date, tpl.amount) for tpl in df_cf.itertuples()], guess)
 
 
-def auction_simulator(speculative=False, df_orders=None):
+def auction_simulator(speculative=None, df_orders=None):
     """
     Simulate the auction round of an AES
 
     Parameters
     ----------
     speculative : bool
-        Is the proposal speculative or a real proposed trade
+        Is the proposal speculative or a real proposed trade? Generate randomly if not provided.
     df_orders : pd.DataFrame
         Price, amount, and side of orders. Side in {'b', 'o', 'p'} for bid, offers, and proposal, respectively.
         Generate randomly if not provided.
+
+    Returns
+    -------
+    pd.DataFrame, float
+        DF df_orders with 'fill' and 'buy_fill' added. Market clearing price.
     """
     tick = 0.0025
 
-    # Combined DF with bids (b), offers (o), and proposal (p)
+    if speculative is None:
+        speculative = random.choice([True, False])
+
+    # Combined DF with all orders: bids (b), offers (o), and proposal (p)
     if df_orders is None:
         num_orders = random.randint(1, 50)
         df_orders = pd.DataFrame({
@@ -567,7 +575,8 @@ def auction_simulator(speculative=False, df_orders=None):
         logging.info(f"No alternative buyers. Proposed trade goes through.")
         df_orders.loc[0, 'fill'] = 0 if speculative else df_orders.loc[0, 'amount']
         df_orders.loc[0, 'buy_fill'] = 0 if speculative else df_orders.loc[0, 'amount']
-        return df_orders
+        df_orders['fill'].fillna(0, inplace=True)
+        return df_orders, df_orders.loc[0, 'price']
     
     # Cumulate bids and offers into bid and ask order books
     df_bidbook = df_orders[df_orders['side'] == 'b'].groupby('price')['amount'].sum().sort_index(
@@ -590,10 +599,14 @@ def auction_simulator(speculative=False, df_orders=None):
 
     # Check for bids higher than the lowest offer
     if not df_book['cum_bid'].le(df_book['cum_ask']).any():
-        logging.info("Only very low bids entered. Proposed trade goes through.")
+        if df_book['cum_bid'].gt(df_book['cum_ask']).any():
+            logging.info("Insufficient offers to execute new bids. Proposed trade goes through.")
+        else:
+            logging.info("Only very low bids entered. Proposed trade goes through.")
         df_orders.loc[0, 'fill'] = 0 if speculative else df_orders.loc[0, 'amount']
         df_orders.loc[0, 'buy_fill'] = 0 if speculative else df_orders.loc[0, 'amount']
-        return
+        df_orders['fill'].fillna(0, inplace=True)
+        return df_orders, df_orders.loc[0, 'price']
     
     # Results of double auction
     mkt_price = df_book.index[df_book['cum_bid'] <= df_book['cum_ask']][0]
@@ -612,7 +625,7 @@ def auction_simulator(speculative=False, df_orders=None):
         df_orders.loc[0, 'buy_fill'] = 0 if speculative else df_orders.loc[0, 'amount']
         if speculative:
             df_orders.loc[(df_orders['price'] - mkt_price > -1e-4) & bids, 'fill'] = df_orders['amount']
-        return
+        return df_orders, df_orders.loc[0, 'price']
     if mkt_price - df_orders.loc[0, 'price'] > 1e-4:
         logging.info(f"Market clearing price ({mkt_price:.4f}) is higher than proposal ({df_orders.loc[0, 'price']}). "
                      "Original EPP is filled at a higher price. "
@@ -635,13 +648,14 @@ def auction_simulator(speculative=False, df_orders=None):
     offer_full_fill = df_askbook.index[df_askbook['cum_amount'] <= mkt_volume - df_orders.loc[0, 'fill']]
     df_orders.loc[df_orders['price'].isin(offer_full_fill) & offers, 'fill'] = df_orders['amount']
     offer_partial_fill = df_orders['fill'].isna() & (df_orders['price'] - mkt_price < 1e-4)
-    offer_partial_fill_ratio = 1 - excess_offers / df_orders.loc[offer_partial_fill, 'amount'].sum()
-    df_orders.loc[offer_partial_fill, 'fill'] = offer_partial_fill_ratio * df_orders['amount']
+    if offer_partial_fill.any():
+        offer_partial_fill_ratio = 1 - excess_offers / df_orders.loc[offer_partial_fill, 'amount'].sum()
+        df_orders.loc[offer_partial_fill, 'fill'] = offer_partial_fill_ratio * df_orders['amount']
     df_orders['fill'].fillna(0, inplace=True)
 
-    # Resubmit low price offers that brough down market prices as a disincentive to skewing prices by submitting large
+    # Resubmit low price offers that brought down market prices as a disincentive to skewing prices by submitting large
     # offers at low prices
-    if mkt_price - df_orders.loc[0, 'price'] < -1e-4:
+    if offer_partial_fill.any() & (mkt_price - df_orders.loc[0, 'price'] < -1e-4):
         df_next_proposal = df_orders[offer_partial_fill].copy()
         df_next_proposal['amount'] -= df_next_proposal['fill']
         df_next_proposal = df_next_proposal.groupby('price')['amount'].sum().reset_index().head(1)
@@ -653,7 +667,7 @@ def auction_simulator(speculative=False, df_orders=None):
     bfill = df_orders.loc[bids, 'fill'].sum() + df_orders.loc[0, 'buy_fill']
     assert abs(ofill - bfill) < 1e-6, f"Bid filled != offer filled, bid={bfill} offer={ofill}"
 
-    return df_orders
+    return df_orders, mkt_price
 
 
 if __name__ == "__main__":
